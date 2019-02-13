@@ -1,86 +1,123 @@
-# Copyright 2018 Deep Learning Service of Huawei Cloud. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-# Train a user defined model with TensorFlow APIs.
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-from tensorflow.examples.tutorials.mnist import input_data
-import tensorflow as tf
-import moxing.tensorflow as mox
+import mxnet as mx
+import argparse
+import logging
 import os
+# load data
+def get_mnist_iter(args):
+    train_image = os.path.join(args.data_url + 'train-images-idx3-ubyte')
+    train_label = os.path.join(args.data_url + 'train-labels-idx1-ubyte')
+    try:
+        import moxing.mxnet as mox
+    except:
+        assert os.path.exists(train_image), 'file train-images-idx3-ubyte is not exist,please check your data url'
+        assert os.path.exists(train_label), 'file train-labels-idx1-ubyte is not exist,please check your data url'
+    else:
+        assert mox.file.exists(train_image), 'file train-images-idx3-ubyte is not exist,please check your data url'
+        assert mox.file.exists(train_image), 'file train-labels-idx1-ubyte is not exist,please check your data url'
 
-tf.flags.DEFINE_string('data_url', None, 'Dir of dataset')
-tf.flags.DEFINE_string('train_url', None, 'Train Url')
+    train = mx.io.MNISTIter(image=train_image,
+                            label=train_label,
+                            data_shape=(1, 28, 28),
+                            batch_size=args.batch_size,
+                            shuffle=True,
+                            flat=False,
+                            silent=False,
+                            seed=10)
+    return train
 
-flags = tf.flags.FLAGS
+# create network
+def get_symbol(num_classes=10, **kwargs):
+    data = mx.symbol.Variable('data')
+    data = mx.sym.Flatten(data=data)
+    fc1  = mx.symbol.FullyConnected(data = data, name='fc1', num_hidden=128)
+    act1 = mx.symbol.Activation(data = fc1, name='relu1', act_type="relu")
+    fc2  = mx.symbol.FullyConnected(data = act1, name = 'fc2', num_hidden = 64)
+    act2 = mx.symbol.Activation(data = fc2, name='relu2', act_type="relu")
+    fc3  = mx.symbol.FullyConnected(data = act2, name='fc3', num_hidden=num_classes)
+    mlp  = mx.symbol.SoftmaxOutput(data = fc3, name = 'softmax')
+    return mlp
 
+def fit(args):
+    # create kvstore
+    kv = mx.kvstore.create(args.kv_store)
+    # logging
+    head = '%(asctime)-15s Node[' + str(kv.rank) + '] %(message)s'
+    logging.basicConfig(level=logging.DEBUG, format=head)
+    logging.info('start with arguments %s', args)
+    # get train data
+    train = get_mnist_iter(args)
+    # create checkpoint
+    checkpoint = mx.callback.do_checkpoint(args.train_url if kv.rank == 0 else "%s-%d" % (
+        args.train_url, kv.rank))
+    # create callbacks after end of every batch
+    batch_end_callbacks = [mx.callback.Speedometer(args.batch_size, args.disp_batches)]
+    # get the created network 
+    network = get_symbol(num_classes=args.num_classes)
+    # create context
+    devs = mx.cpu() if args.num_gpus == 0 else [mx.gpu(int(i)) for i in range(args.num_gpus)]
+    # create model
+    model = mx.mod.Module(context=devs, symbol=network)
+    # create an initialization method
+    initializer = mx.init.Xavier(rnd_type='gaussian', factor_type="in", magnitude=2)
+    # create params of optimizer
+    optimizer_params = {'learning_rate': args.lr, 'wd' : 0.0001}
+    # run
+    model.fit(train,
+              begin_epoch=0,
+              num_epoch=args.num_epochs,
+              eval_data=None,
+              eval_metric=['accuracy'],
+              kvstore=kv,
+              optimizer='sgd',
+              optimizer_params=optimizer_params,
+              initializer=initializer,
+              arg_params=None,
+              aux_params=None,
+              batch_end_callback=batch_end_callbacks,
+              epoch_end_callback=checkpoint,
+              allow_missing=True)
 
-def check_dataset():
-  work_directory = flags.data_url
-  filenames = ['train-images-idx3-ubyte.gz', 'train-labels-idx1-ubyte.gz', 't10k-images-idx3-ubyte.gz',
-               't10k-labels-idx1-ubyte.gz']
-
-  for filename in filenames:
-    filepath = os.path.join(work_directory, filename)
-    if not mox.file.exists(filepath):
-      raise ValueError('MNIST dataset file %s not found in %s' % (filepath, work_directory))
-
-
-def main(*args, **kwargs):
-  check_dataset()
-  mnist = input_data.read_data_sets(flags.data_url, one_hot=True)
-
-
-  # define the input dataset, return image and label
-  def input_fn(run_mode, **kwargs):
-    def gen():
-      while True:
-        yield mnist.train.next_batch(50)
-    ds = tf.data.Dataset.from_generator(
-        gen, output_types=(tf.float32, tf.int64),
-        output_shapes=(tf.TensorShape([None, 784]), tf.TensorShape([None, 10])))
-    return ds.make_one_shot_iterator().get_next()
-
-
-  # define the model for training or evaling.
-  def model_fn(inputs, run_mode, **kwargs):
-    x, y_ = inputs
-    W = tf.get_variable(name='W', initializer=tf.zeros([784, 10]))
-    b = tf.get_variable(name='b', initializer=tf.zeros([10]))
-    y = tf.matmul(x, W) + b
-    cross_entropy = tf.reduce_mean(
-      tf.nn.softmax_cross_entropy_with_logits(labels=y_, logits=y))
-    correct_prediction = tf.equal(tf.argmax(y, 1), tf.argmax(y_, 1))
-    accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-    export_spec = mox.ExportSpec(inputs_dict={'images': x}, outputs_dict={'logits': y}, version='model')
-    return mox.ModelSpec(loss=cross_entropy, log_info={'loss': cross_entropy, 'accuracy': accuracy},
-                         export_spec=export_spec)
-
-
-  mox.run(input_fn=input_fn,
-          model_fn=model_fn,
-          optimizer_fn=mox.get_optimizer_fn('sgd', learning_rate=0.01),
-          run_mode=mox.ModeKeys.TRAIN,
-          batch_size=50,
-          auto_batch=False,
-          log_dir=flags.train_url,
-          max_number_of_steps=1000,
-          log_every_n_steps=10,
-          export_model=mox.ExportKeys.TF_SERVING)
+    if args.export_model == 1 and args.train_url is not None and len(args.train_url):
+        import moxing.mxnet as mox
+        end_epoch = args.num_epochs
+        save_path = args.train_url if kv.rank == 0 else "%s-%d" % (args.train_url, kv.rank)
+        params_path = '%s-%04d.params' % (save_path, end_epoch)
+        json_path = ('%s-symbol.json' % save_path)
+        logging.info(params_path + 'used to predict')
+        pred_params_path = os.path.join(args.train_url, 'model', 'pred_model-0000.params')
+        pred_json_path = os.path.join(args.train_url, 'model', 'pred_model-symbol.json')
+        mox.file.copy(params_path, pred_params_path)
+        mox.file.copy(json_path, pred_json_path)
+        for i in range(1, args.num_epochs + 1, 1):
+            mox.file.remove('%s-%04d.params' % (save_path, i))
+        mox.file.remove(json_path)
 
 if __name__ == '__main__':
-  tf.app.run(main=main)
+    # parse args
+    parser = argparse.ArgumentParser(description="train mnist",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--num_classes', type=int, default=10,
+                        help='the number of classes')
+    parser.add_argument('--num_examples', type=int, default=60000,
+                        help='the number of training examples')
+
+    parser.add_argument('--data_url', type=str, default='s3://obs-lpf/data/', help='the training data')
+    parser.add_argument('--lr', type=float, default=0.05,
+                        help='initial learning rate')
+    parser.add_argument('--num_epochs', type=int, default=10,
+                        help='max num of epochs')
+    parser.add_argument('--disp_batches', type=int, default=20,
+                        help='show progress for every n batches')
+    parser.add_argument('--batch_size', type=int, default=128,
+                        help='the batch size')
+    parser.add_argument('--kv_store', type=str, default='device',
+                        help='key-value store type')
+    parser.add_argument('--train_url', type=str, default='s3://obs-lpf/ckpt/mnist',
+                        help='the path model saved')
+    parser.add_argument('--num_gpus', type=int, default='0',
+                        help='number of gpus')
+    parser.add_argument('--export_model', type=int, default=1, help='1: export model for predict job \
+                                                                     0: not export model')
+    args, unkown = parser.parse_known_args()
+
+    fit(args)
